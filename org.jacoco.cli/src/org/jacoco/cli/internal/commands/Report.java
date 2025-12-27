@@ -22,6 +22,9 @@ import java.util.Collection;
 import java.util.List;
 
 import org.jacoco.cli.internal.Command;
+import org.jacoco.cli.internal.git.GitException;
+import org.jacoco.cli.internal.git.GitRepository;
+import org.jacoco.cli.internal.git.IncrementalFileFilter;
 import org.jacoco.core.analysis.Analyzer;
 import org.jacoco.core.analysis.CoverageBuilder;
 import org.jacoco.core.analysis.IBundleCoverage;
@@ -72,19 +75,186 @@ public class Report extends Command {
 	@Option(name = "--html", usage = "output directory for the HTML report", metaVar = "<dir>")
 	File html;
 
+	@Option(name = "--branch", usage = "Git分支名称，用于增量分析", metaVar = "<branch>")
+	String branch;
+
+	@Option(name = "--commit", usage = "Git提交标识（格式与git checkout兼容），用于增量分析起始点", metaVar = "<commit>")
+	String commit;
+
 	@Override
 	public String description() {
-		return "Generate reports in different formats by reading exec and Java class files.";
+		return "Generate reports in different formats by reading exec and Java class files. "
+				+ "支持增量分析：使用--branch和--commit参数可以仅分析指定提交之后的代码变更。";
 	}
 
 	@Override
 	public int execute(final PrintWriter out, final PrintWriter err)
 			throws IOException {
+		// 如果指定了增量分析参数，进行文件过滤
+		if (branch != null || commit != null) {
+			try {
+				filterIncrementalFiles(out);
+			} catch (final GitException e) {
+				err.println("[ERROR] " + e.getMessage());
+				if (e.getCause() != null) {
+					err.println("[ERROR] 原因: " + e.getCause().getMessage());
+				}
+				return -1;
+			}
+		}
+
 		final ExecFileLoader loader = loadExecutionData(out);
 		final IBundleCoverage bundle = analyze(loader.getExecutionDataStore(),
 				out);
 		writeReports(bundle, loader, out);
 		return 0;
+	}
+
+	/**
+	 * 过滤增量文件。 如果指定了--branch或--commit参数，则只分析增量代码。
+	 *
+	 * @param out
+	 *            输出流
+	 * @throws GitException
+	 *             如果Git操作失败
+	 */
+	private void filterIncrementalFiles(final PrintWriter out)
+			throws GitException {
+		// 确定Git仓库目录
+		// 策略：从classfiles或sourcefiles目录向上查找.git目录
+		File repoDir = findGitRepositoryRoot();
+		if (repoDir == null) {
+			// 如果找不到，使用当前工作目录
+			repoDir = new File(System.getProperty("user.dir", "."));
+		}
+
+		final GitRepository gitRepo = new GitRepository(repoDir);
+		try {
+			if (!gitRepo.isGitRepository()) {
+				throw new GitException(
+						"当前目录不是Git仓库: " + repoDir.getAbsolutePath()
+								+ "。请确保在Git仓库目录中运行命令，或指定正确的classfiles路径。");
+			}
+
+			// 解析提交
+			org.eclipse.jgit.revwalk.RevCommit startCommit;
+			if (commit != null) {
+				// 如果指定了commit，解析它
+				try {
+					startCommit = gitRepo.resolveCommit(commit);
+					out.printf("[INFO] 使用提交: %s (%.7s)%n",
+							startCommit.getName(), startCommit.getName());
+				} catch (final GitException e) {
+					throw new GitException(
+							"无法解析提交 '" + commit + "': " + e.getMessage(), e);
+				}
+			} else if (branch != null) {
+				// 如果只指定了branch，获取分支的第一次提交
+				try {
+					startCommit = gitRepo.getFirstCommit(branch);
+					out.printf("[INFO] 使用分支 %s 的第一次提交: %s (%.7s)%n", branch,
+							startCommit.getName(), startCommit.getName());
+				} catch (final GitException e) {
+					throw new GitException(
+							"无法获取分支 '" + branch + "' 的第一次提交: " + e.getMessage(),
+							e);
+				}
+			} else {
+				// 不应该到达这里，但为了安全起见
+				return;
+			}
+
+			// 获取变更的Java文件列表
+			final java.util.Set<String> changedJavaFiles = gitRepo
+					.getChangedJavaFiles(startCommit);
+			out.printf("[INFO] 发现 %d 个变更的Java文件%n",
+					Integer.valueOf(changedJavaFiles.size()));
+
+			// 过滤文件列表
+			final IncrementalFileFilter filter = new IncrementalFileFilter();
+			final List<File> filteredClassfiles = filter
+					.filterClassFiles(classfiles, changedJavaFiles);
+			final List<File> filteredSourcefiles = filter
+					.filterSourceFiles(sourcefiles, changedJavaFiles);
+
+			// 检查是否有文件无法映射（记录警告）
+			int unmappedCount = 0;
+			for (final String javaPath : changedJavaFiles) {
+				final File mappedClassFile = filter.mapJavaToClassFile(javaPath,
+						classfiles);
+				if (mappedClassFile == null) {
+					unmappedCount++;
+					if (unmappedCount <= 5) { // 只显示前5个警告
+						out.printf("[WARN] 无法找到Java源文件对应的类文件: %s%n", javaPath);
+					}
+				}
+			}
+			if (unmappedCount > 5) {
+				out.printf("[WARN] 还有 %d 个文件无法映射到类文件（已省略详细信息）%n",
+						Integer.valueOf(unmappedCount - 5));
+			}
+
+			// 更新文件列表
+			classfiles.clear();
+			classfiles.addAll(filteredClassfiles);
+			sourcefiles.clear();
+			sourcefiles.addAll(filteredSourcefiles);
+
+			out.printf("[INFO] 过滤后: %d 个类文件, %d 个源文件%n",
+					Integer.valueOf(classfiles.size()),
+					Integer.valueOf(sourcefiles.size()));
+		} finally {
+			gitRepo.close();
+		}
+	}
+
+	/**
+	 * 查找Git仓库根目录。 从classfiles或sourcefiles目录向上查找，直到找到包含.git的目录。
+	 *
+	 * @return Git仓库根目录，如果找不到则返回null
+	 */
+	private File findGitRepositoryRoot() {
+		// 尝试从classfiles目录查找
+		if (!classfiles.isEmpty()) {
+			final File repoDir = findGitRootFromFile(classfiles.get(0));
+			if (repoDir != null) {
+				return repoDir;
+			}
+		}
+		// 尝试从sourcefiles目录查找
+		if (!sourcefiles.isEmpty()) {
+			final File repoDir = findGitRootFromFile(sourcefiles.get(0));
+			if (repoDir != null) {
+				return repoDir;
+			}
+		}
+		// 尝试从当前工作目录查找
+		return findGitRootFromFile(
+				new File(System.getProperty("user.dir", ".")));
+	}
+
+	/**
+	 * 从指定文件/目录向上查找Git仓库根目录。
+	 *
+	 * @param startFile
+	 *            起始文件或目录
+	 * @return Git仓库根目录，如果找不到则返回null
+	 */
+	private File findGitRootFromFile(final File startFile) {
+		File current = startFile.isFile() ? startFile.getParentFile()
+				: startFile;
+		while (current != null) {
+			final File gitDir = new File(current, ".git");
+			if (gitDir.exists() && (gitDir.isDirectory() || gitDir.isFile())) {
+				return current;
+			}
+			final File parent = current.getParentFile();
+			if (parent == null || parent.equals(current)) {
+				break;
+			}
+			current = parent;
+		}
+		return null;
 	}
 
 	private ExecFileLoader loadExecutionData(final PrintWriter out)

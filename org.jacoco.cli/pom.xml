@@ -38,6 +38,12 @@
       <groupId>args4j</groupId>
       <artifactId>args4j</artifactId>
     </dependency>
+    <dependency>
+      <groupId>org.eclipse.jgit</groupId>
+      <artifactId>org.eclipse.jgit</artifactId>
+      <version>6.9.0.202403050737-r</version>
+    </dependency>
+
   </dependencies>
 
   <build>
@@ -75,8 +81,7 @@
               <goal>shade</goal>
             </goals>
             <configuration>
-              <shadedArtifactAttached>true</shadedArtifactAttached>
-              <shadedClassifierName>nodeps</shadedClassifierName>
+              <shadedArtifactAttached>false</shadedArtifactAttached>
               <minimizeJar>true</minimizeJar>
               <relocations>
                 <relocation>
@@ -111,6 +116,9 @@
                   <artifact>*:*</artifact>
                   <excludes>
                     <exclude>META-INF/MANIFEST.MF</exclude>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
                   </excludes>
                 </filter>
                 <filter>
@@ -141,6 +149,18 @@
             </configuration>
           </execution>
         </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.5.0</version>
+        <configuration>
+        <archive>
+        <manifest>
+        <mainClass>org.jacoco.cli.internal.Main</mainClass>
+        </manifest>
+        </archive>
+        </configuration>
       </plugin>
     </plugins>
   </build>
